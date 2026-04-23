@@ -1,0 +1,7 @@
+.{
+    .name = .qemu_gdb_mcp,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0x4a0cc6bef8b0766,
+}
