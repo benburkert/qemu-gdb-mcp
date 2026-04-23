@@ -1,6 +1,11 @@
 .{
     .name = .qemu_gdb_mcp,
     .version = "0.0.1",
+    .dependencies = .{
+        .mcp = .{
+            .path = "git+https://github.com/benburkert/mcp.zig.git#fdcf351801901424feedf5da33428c370ac4ae4a",
+        },
+    },
     .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .fingerprint = 0x4a0cc6bef8b0766,
