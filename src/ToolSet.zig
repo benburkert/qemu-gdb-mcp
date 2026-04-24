@@ -10,7 +10,28 @@ const mi = @import("gdb/mi.zig");
 
 const ToolSet = @This();
 
-client: *Client,
+client: ?*Client = null,
+config: Client.Config,
+io: std.Io,
+allocator: std.mem.Allocator,
+
+fn ensureClient(self: *ToolSet) !*Client {
+    if (self.client) |c| return c;
+
+    const c = try self.allocator.create(Client);
+    c.* = try Client.init(self.io, self.allocator, self.config);
+    try c.start(self.io, self.allocator);
+    self.client = c;
+    return c;
+}
+
+pub fn deinit(self: *ToolSet) void {
+    if (self.client) |c| {
+        c.deinit(self.io);
+        self.allocator.destroy(c);
+        self.client = null;
+    }
+}
 
 pub fn register(self: *ToolSet, server: *mcp.Server) !void {
     const tools = [_]mcp.tools.Tool{
@@ -136,6 +157,19 @@ pub fn register(self: *ToolSet, server: *mcp.Server) !void {
             .user_data = self,
         },
         .{
+            .name = "list_threads",
+            .description = "List all threads (harts). Shows thread ID, target ID, name, and current frame.",
+            .handler = listThreads,
+            .annotations = .{ .readOnlyHint = true, .idempotentHint = true, .destructiveHint = false, .openWorldHint = false },
+            .user_data = self,
+        },
+        .{
+            .name = "select_thread",
+            .description = "Switch to a specific thread (hart). Args: thread (integer, thread ID)",
+            .handler = selectThread,
+            .user_data = self,
+        },
+        .{
             .name = "stepi_no_irq",
             .description = "Single-step one instruction with IRQ/timer suppression. Prevents timer interrupts from disrupting stepping during kernel debugging.",
             .handler = stepiNoIrq,
@@ -202,16 +236,18 @@ fn targetConnect(
     const target = mcp.tools.getString(arguments, "target") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: target (e.g. ':1234')");
 
+    const client = ts.ensureClient() catch
+        return try mcp.tools.errorResult(allocator, "Failed to start GDB");
+
     // Optionally load symbol file first
     if (mcp.tools.getString(arguments, "image")) |image| {
         const file_cmd = try std.fmt.allocPrint(allocator, "file-exec-and-symbols {s}", .{image});
         defer allocator.free(file_cmd);
-        var file_resp = ts.client.command(allocator, file_cmd) catch |err| return errResult(allocator, "Failed to load symbols", err);
+        var file_resp = client.command(allocator, file_cmd) catch |err| return errResult(allocator, "Failed to load symbols", err);
         defer file_resp.deinit();
-        // Ignore errors — symbol loading is best-effort
     }
 
-    var resp = ts.client.connect(allocator, target) catch |err| return errResult(allocator, "Failed to connect", err);
+    var resp = client.connect(allocator, target) catch |err| return errResult(allocator, "Failed to connect", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -232,8 +268,9 @@ fn targetDisconnect(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.disconnect(allocator) catch |err| return errResult(allocator, "Failed to disconnect", err);
+    var resp = client.disconnect(allocator) catch |err| return errResult(allocator, "Failed to disconnect", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -249,15 +286,16 @@ fn readRegisters(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var names_resp = ts.client.command(allocator, "data-list-register-names") catch |err|
+    var names_resp = client.command(allocator, "data-list-register-names") catch |err|
         return errResult(allocator, "Failed to list register names", err);
     defer names_resp.deinit();
 
     if (names_resp.isError())
         return try mcp.tools.errorResult(allocator, names_resp.errorMessage() orelse "Unknown error");
 
-    var values_resp = ts.client.command(allocator, "data-list-register-values x") catch |err|
+    var values_resp = client.command(allocator, "data-list-register-values x") catch |err|
         return errResult(allocator, "Failed to read register values", err);
     defer values_resp.deinit();
 
@@ -303,8 +341,9 @@ fn step(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
+    var resp = client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
         return errResult(allocator, "Failed to step", err);
     defer resp.deinit();
 
@@ -321,8 +360,9 @@ fn cont(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.commandExpectStop(allocator, "exec-continue") catch |err|
+    var resp = client.commandExpectStop(allocator, "exec-continue") catch |err|
         return errResult(allocator, "Failed to continue", err);
     defer resp.deinit();
 
@@ -339,8 +379,9 @@ fn stop(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.command(allocator, "exec-interrupt") catch |err|
+    var resp = client.command(allocator, "exec-interrupt") catch |err|
         return errResult(allocator, "Failed to interrupt", err);
     defer resp.deinit();
 
@@ -357,6 +398,7 @@ fn readMemory(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const address = mcp.tools.getString(arguments, "address") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: address");
@@ -366,7 +408,7 @@ fn readMemory(
     const cmd = try std.fmt.allocPrint(allocator, "data-read-memory-bytes {s} {d}", .{ address, count });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to read memory", err);
     defer resp.deinit();
 
@@ -408,6 +450,7 @@ fn writeMemory(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const address = mcp.tools.getString(arguments, "address") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: address");
@@ -418,7 +461,7 @@ fn writeMemory(
     const cmd = try std.fmt.allocPrint(allocator, "data-write-memory-bytes {s} {s}", .{ address, data });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to write memory", err);
     defer resp.deinit();
 
@@ -436,6 +479,7 @@ fn setBreakpoint(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const location = mcp.tools.getString(arguments, "location") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: location");
@@ -459,7 +503,7 @@ fn setBreakpoint(
     const cmd = try cmd_buf.toOwnedSlice(allocator);
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to set breakpoint", err);
     defer resp.deinit();
 
@@ -493,6 +537,7 @@ fn removeBreakpoint(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const number = mcp.tools.getInteger(arguments, "number") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: number");
@@ -500,7 +545,7 @@ fn removeBreakpoint(
     const cmd = try std.fmt.allocPrint(allocator, "break-delete {d}", .{number});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to remove breakpoint", err);
     defer resp.deinit();
 
@@ -518,8 +563,9 @@ fn listBreakpoints(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.command(allocator, "break-list") catch |err|
+    var resp = client.command(allocator, "break-list") catch |err|
         return errResult(allocator, "Failed to list breakpoints", err);
     defer resp.deinit();
 
@@ -575,8 +621,9 @@ fn backtrace(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
-    var resp = ts.client.command(allocator, "stack-list-frames") catch |err|
+    var resp = client.command(allocator, "stack-list-frames") catch |err|
         return errResult(allocator, "Failed to get backtrace", err);
     defer resp.deinit();
 
@@ -628,6 +675,7 @@ fn disassemble(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const address = mcp.tools.getString(arguments, "address") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: address");
@@ -638,7 +686,7 @@ fn disassemble(
     const cmd = try std.fmt.allocPrint(allocator, "data-disassemble -s {s} -e {s}+{d} -- 0", .{ address, address, count * 4 });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to disassemble", err);
     defer resp.deinit();
 
@@ -691,6 +739,7 @@ fn writeRegister(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const reg_name = mcp.tools.getString(arguments, "register") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: register");
@@ -701,7 +750,7 @@ fn writeRegister(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression ${s}={s}", .{ reg_name, value });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to write register", err);
     defer resp.deinit();
 
@@ -719,6 +768,7 @@ fn evalExpression(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const expression = mcp.tools.getString(arguments, "expression") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: expression");
@@ -726,7 +776,7 @@ fn evalExpression(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression {s}", .{expression});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to evaluate expression", err);
     defer resp.deinit();
 
@@ -744,6 +794,7 @@ fn lookupSymbol(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const name = mcp.tools.getString(arguments, "name") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: name");
@@ -751,7 +802,7 @@ fn lookupSymbol(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression &{s}", .{name});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch |err|
+    var resp = client.command(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to lookup symbol", err);
     defer resp.deinit();
 
@@ -770,11 +821,12 @@ fn info(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
 
     // Current frame
-    if (ts.client.command(allocator, "stack-info-frame")) |resp_val| {
+    if (client.command(allocator, "stack-info-frame")) |resp_val| {
         var resp = resp_val;
         defer resp.deinit();
         if (!resp.isError()) {
@@ -792,7 +844,7 @@ fn info(
     } else |_| {}
 
     // Privilege level (RISC-V virtual register)
-    if (ts.client.command(allocator, "data-evaluate-expression $priv")) |resp_val| {
+    if (client.command(allocator, "data-evaluate-expression $priv")) |resp_val| {
         var resp = resp_val;
         defer resp.deinit();
         if (!resp.isError()) {
@@ -817,6 +869,7 @@ fn monitor(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const command = mcp.tools.getString(arguments, "command") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: command");
@@ -824,7 +877,7 @@ fn monitor(
     const cmd = try std.fmt.allocPrint(allocator, "monitor {s}", .{command});
     defer allocator.free(cmd);
 
-    var resp = ts.client.cliCommand(allocator, cmd) catch |err|
+    var resp = client.cliCommand(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to execute monitor command", err);
     defer resp.deinit();
 
@@ -838,6 +891,116 @@ fn monitor(
     return try mcp.tools.textResult(allocator, console_out);
 }
 
+fn listThreads(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
+
+    var resp = client.command(allocator, "thread-info") catch |err| return errResult(allocator, "Failed to list threads", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    const threads_val = resp.result.get("threads") orelse
+        return try mcp.tools.errorResult(allocator, "Missing threads in response");
+
+    const threads = switch (threads_val) {
+        .list => |l| switch (l) {
+            .values => |vs| vs,
+            .empty => return try mcp.tools.textResult(allocator, "No threads"),
+            else => return try mcp.tools.errorResult(allocator, "Unexpected threads format"),
+        },
+        else => return try mcp.tools.errorResult(allocator, "Unexpected threads format"),
+    };
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+
+    // Show current thread ID if available
+    if (resp.result.results.getString("current-thread-id")) |current| {
+        try output.appendSlice(allocator, "Current thread: ");
+        try output.appendSlice(allocator, current);
+        try output.append(allocator, '\n');
+    }
+
+    for (threads) |entry| {
+        const thread = entry.tuple;
+        try output.appendSlice(allocator, thread.getString("id") orelse "?");
+        try output.appendSlice(allocator, "  ");
+        if (thread.getString("target-id")) |tid| {
+            try output.appendSlice(allocator, tid);
+            try output.appendSlice(allocator, "  ");
+        }
+        if (thread.getString("name")) |name| {
+            try output.appendSlice(allocator, name);
+            try output.appendSlice(allocator, "  ");
+        }
+        if (thread.getString("state")) |state| {
+            try output.appendSlice(allocator, "(");
+            try output.appendSlice(allocator, state);
+            try output.appendSlice(allocator, ")");
+        }
+        if (thread.get("frame")) |frame_val| {
+            const frame = frame_val.tuple;
+            if (frame.getString("addr")) |addr| {
+                try output.appendSlice(allocator, " at ");
+                try output.appendSlice(allocator, addr);
+            }
+            if (frame.getString("func")) |func| {
+                try output.appendSlice(allocator, " in ");
+                try output.appendSlice(allocator, func);
+            }
+        }
+        try output.append(allocator, '\n');
+    }
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
+fn selectThread(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
+
+    const thread_id = mcp.tools.getInteger(arguments, "thread") orelse
+        return try mcp.tools.errorResult(allocator, "Missing required argument: thread (integer)");
+
+    const cmd = try std.fmt.allocPrint(allocator, "thread-select {d}", .{thread_id});
+    defer allocator.free(cmd);
+
+    var resp = client.command(allocator, cmd) catch |err| return errResult(allocator, "Failed to select thread", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    try output.appendSlice(allocator, try std.fmt.allocPrint(allocator, "Switched to thread {d}", .{thread_id}));
+
+    if (resp.result.get("frame")) |frame_val| {
+        const frame = frame_val.tuple;
+        if (frame.getString("addr")) |addr| {
+            try output.appendSlice(allocator, " at ");
+            try output.appendSlice(allocator, addr);
+        }
+        if (frame.getString("func")) |func| {
+            try output.appendSlice(allocator, " in ");
+            try output.appendSlice(allocator, func);
+        }
+    }
+    try output.append(allocator, '\n');
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
 fn stepiNoIrq(
     user_data: ?*anyopaque,
     _: std.Io,
@@ -845,19 +1008,20 @@ fn stepiNoIrq(
     _: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     // Save current sstep mask
-    var save_resp = ts.client.cliCommand(allocator, "maintenance packet qqemu.sstep") catch |err|
+    var save_resp = client.cliCommand(allocator, "maintenance packet qqemu.sstep") catch |err|
         return errResult(allocator, "Failed to query sstep mask", err);
     defer save_resp.deinit();
 
     // Set sstep mask to suppress IRQs and timers (ENABLE=0x1 | NOTIMER=0x4 = 0x5)
-    var set_resp = ts.client.cliCommand(allocator, "maintenance packet Qqemu.sstep=0x5") catch |err|
+    var set_resp = client.cliCommand(allocator, "maintenance packet Qqemu.sstep=0x5") catch |err|
         return errResult(allocator, "Failed to set sstep mask", err);
     defer set_resp.deinit();
 
     // Step one instruction
-    var step_resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
+    var step_resp = client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
         return errResult(allocator, "Failed to step", err);
     defer step_resp.deinit();
 
@@ -870,7 +1034,7 @@ fn stepiNoIrq(
         while (hex_end < saved.len and std.ascii.isHex(saved[hex_end])) : (hex_end += 1) {}
         const restore_cmd = try std.fmt.allocPrint(allocator, "maintenance packet Qqemu.sstep={s}", .{saved[hex_start..hex_end]});
         defer allocator.free(restore_cmd);
-        if (ts.client.cliCommand(allocator, restore_cmd)) |resp_val| {
+        if (client.cliCommand(allocator, restore_cmd)) |resp_val| {
             var resp = resp_val;
             resp.deinit();
         } else |_| {}
@@ -889,6 +1053,7 @@ fn setPhysicalMemoryMode(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const enabled = mcp.tools.getBoolean(arguments, "enabled") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: enabled (bool)");
@@ -898,7 +1063,7 @@ fn setPhysicalMemoryMode(
     else
         "maintenance packet Qqemu.PhyMemMode:0";
 
-    var resp = ts.client.cliCommand(allocator, cmd) catch |err|
+    var resp = client.cliCommand(allocator, cmd) catch |err|
         return errResult(allocator, "Failed to set physical memory mode", err);
     defer resp.deinit();
 
@@ -918,6 +1083,7 @@ fn readPageTable(
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
 
     const max_depth: usize = @intCast(mcp.tools.getInteger(arguments, "depth") orelse 3);
 
@@ -932,7 +1098,7 @@ fn readPageTable(
         mode = 8; // assume Sv39
     } else {
         // Read satp CSR
-        var resp = ts.client.command(allocator, "data-evaluate-expression $satp") catch |err|
+        var resp = client.command(allocator, "data-evaluate-expression $satp") catch |err|
             return errResult(allocator, "Failed to read satp", err);
         defer resp.deinit();
 
@@ -975,7 +1141,7 @@ fn readPageTable(
 
     // Walk the page table
     const walk_depth = @min(page_mode.levels(), max_depth);
-    try walkPageTable(ts.client, allocator, &output, root_ppn, page_mode, walk_depth, 0, 0);
+    try walkPageTable(client, allocator, &output, root_ppn, page_mode, walk_depth, 0, 0);
 
     if (output.items.len == 0)
         return try mcp.tools.textResult(allocator, "Empty page table");

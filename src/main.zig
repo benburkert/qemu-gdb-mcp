@@ -20,14 +20,12 @@ fn run(init: std.process.Init) !void {
 
     const config = parseArgs(&args);
 
-    var client: Client = Client.init(io, allocator, config) catch |err| {
-        std.debug.print("Failed to start GDB: {}\n", .{err});
-        return err;
+    var tool_set: ToolSet = .{
+        .config = config,
+        .io = io,
+        .allocator = allocator,
     };
-    defer client.deinit(io);
-    try client.start(io, allocator);
-
-    var tool_set: ToolSet = .{ .client = &client };
+    defer tool_set.deinit();
 
     var server: mcp.Server = .init(allocator, .{
         .name = "qemu-gdb-mcp",
