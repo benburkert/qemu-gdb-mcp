@@ -241,8 +241,7 @@ fn step(
     if (resp.isError())
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
-    const text = formatStopReason(allocator, resp.stop) catch return error.OutOfMemory;
-    return try mcp.tools.textResult(allocator, text);
+    return try mcp.tools.textResult(allocator, try formatStopReason(allocator, resp.stop));
 }
 
 fn cont(
@@ -260,8 +259,7 @@ fn cont(
     if (resp.isError())
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
-    const text = formatStopReason(allocator, resp.stop) catch return error.OutOfMemory;
-    return try mcp.tools.textResult(allocator, text);
+    return try mcp.tools.textResult(allocator, try formatStopReason(allocator, resp.stop));
 }
 
 fn stop(
@@ -295,8 +293,7 @@ fn readMemory(
 
     const count = mcp.tools.getInteger(arguments, "count") orelse 64;
 
-    const cmd = std.fmt.allocPrint(allocator, "data-read-memory-bytes {s} {d}", .{ address, count }) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-read-memory-bytes {s} {d}", .{ address, count });
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -348,8 +345,7 @@ fn writeMemory(
     const data = mcp.tools.getString(arguments, "data") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: data");
 
-    const cmd = std.fmt.allocPrint(allocator, "data-write-memory-bytes {s} {s}", .{ address, data }) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-write-memory-bytes {s} {s}", .{ address, data });
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -359,7 +355,7 @@ fn writeMemory(
     if (resp.isError())
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
-    const msg = std.fmt.allocPrint(allocator, "Wrote to {s}", .{address}) catch return error.OutOfMemory;
+    const msg = try std.fmt.allocPrint(allocator, "Wrote to {s}", .{address});
     return try mcp.tools.textResult(allocator, msg);
 }
 
@@ -431,7 +427,7 @@ fn removeBreakpoint(
     const number = mcp.tools.getInteger(arguments, "number") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: number");
 
-    const cmd = std.fmt.allocPrint(allocator, "break-delete {d}", .{number}) catch return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "break-delete {d}", .{number});
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -441,7 +437,7 @@ fn removeBreakpoint(
     if (resp.isError())
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
-    const msg = std.fmt.allocPrint(allocator, "Breakpoint {d} removed", .{number}) catch return error.OutOfMemory;
+    const msg = try std.fmt.allocPrint(allocator, "Breakpoint {d} removed", .{number});
     return try mcp.tools.textResult(allocator, msg);
 }
 
@@ -569,8 +565,7 @@ fn disassemble(
     const count = mcp.tools.getInteger(arguments, "count") orelse 16;
 
     // Use -data-disassemble with line count mode
-    const cmd = std.fmt.allocPrint(allocator, "data-disassemble -s {s} -e {s}+{d} -- 0", .{ address, address, count * 4 }) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-disassemble -s {s} -e {s}+{d} -- 0", .{ address, address, count * 4 });
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -633,8 +628,7 @@ fn writeRegister(
     const value = mcp.tools.getString(arguments, "value") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: value");
 
-    const cmd = std.fmt.allocPrint(allocator, "data-evaluate-expression ${s}={s}", .{ reg_name, value }) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression ${s}={s}", .{ reg_name, value });
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -644,7 +638,7 @@ fn writeRegister(
     if (resp.isError())
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
-    const msg = std.fmt.allocPrint(allocator, "${s} = {s}", .{ reg_name, value }) catch return error.OutOfMemory;
+    const msg = try std.fmt.allocPrint(allocator, "${s} = {s}", .{ reg_name, value });
     return try mcp.tools.textResult(allocator, msg);
 }
 
@@ -659,8 +653,7 @@ fn evalExpression(
     const expression = mcp.tools.getString(arguments, "expression") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: expression");
 
-    const cmd = std.fmt.allocPrint(allocator, "data-evaluate-expression {s}", .{expression}) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression {s}", .{expression});
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -685,8 +678,7 @@ fn lookupSymbol(
     const name = mcp.tools.getString(arguments, "name") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: name");
 
-    const cmd = std.fmt.allocPrint(allocator, "data-evaluate-expression &{s}", .{name}) catch
-        return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression &{s}", .{name});
     defer allocator.free(cmd);
 
     var resp = ts.client.command(allocator, cmd) catch
@@ -697,7 +689,7 @@ fn lookupSymbol(
         return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
 
     const result_val = resp.result.results.getString("value") orelse "not found";
-    const msg = std.fmt.allocPrint(allocator, "{s} = {s}", .{ name, result_val }) catch return error.OutOfMemory;
+    const msg = try std.fmt.allocPrint(allocator, "{s} = {s}", .{ name, result_val });
     return try mcp.tools.textResult(allocator, msg);
 }
 
@@ -759,7 +751,7 @@ fn monitor(
     const command = mcp.tools.getString(arguments, "command") orelse
         return try mcp.tools.errorResult(allocator, "Missing required argument: command");
 
-    const cmd = std.fmt.allocPrint(allocator, "monitor {s}", .{command}) catch return error.OutOfMemory;
+    const cmd = try std.fmt.allocPrint(allocator, "monitor {s}", .{command});
     defer allocator.free(cmd);
 
     var resp = ts.client.cliCommand(allocator, cmd) catch
@@ -799,13 +791,14 @@ fn stepiNoIrq(
         return try mcp.tools.errorResult(allocator, "Failed to step");
     defer step_resp.deinit();
 
-    // Restore original sstep mask
+    // Restore original sstep mask by extracting it from the save response
+    // The response contains the hex value in the console output
     const saved = save_resp.consoleOutput();
     if (std.mem.indexOf(u8, saved, "0x")) |start| {
         const hex_start = start;
         var hex_end = hex_start + 2;
         while (hex_end < saved.len and std.ascii.isHex(saved[hex_end])) : (hex_end += 1) {}
-        const restore_cmd = std.fmt.allocPrint(allocator, "maintenance packet Qqemu.sstep={s}", .{saved[hex_start..hex_end]}) catch return error.OutOfMemory;
+        const restore_cmd = try std.fmt.allocPrint(allocator, "maintenance packet Qqemu.sstep={s}", .{saved[hex_start..hex_end]});
         defer allocator.free(restore_cmd);
         if (ts.client.cliCommand(allocator, restore_cmd)) |resp_val| {
             var resp = resp_val;
@@ -816,8 +809,7 @@ fn stepiNoIrq(
     if (step_resp.isError())
         return try mcp.tools.errorResult(allocator, step_resp.errorMessage() orelse "Unknown error");
 
-    const text = formatStopReason(allocator, step_resp.stop) catch return error.OutOfMemory;
-    return try mcp.tools.textResult(allocator, text);
+    return try mcp.tools.textResult(allocator, try formatStopReason(allocator, step_resp.stop));
 }
 
 fn setPhysicalMemoryMode(
@@ -895,7 +887,7 @@ fn readPageTable(
         10 => .sv57,
         else => return try mcp.tools.errorResult(
             allocator,
-            std.fmt.allocPrint(allocator, "Unknown satp mode: {d}", .{mode}) catch return error.OutOfMemory,
+            try std.fmt.allocPrint(allocator, "Unknown satp mode: {d}", .{mode}),
         ),
     };
 
