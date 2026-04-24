@@ -81,19 +81,19 @@ pub const Tuple = struct {
         var results: std.ArrayListUnmanaged(Result) = .empty;
 
         const first: Result = try .parse(allocator, input, pos);
-        results.append(allocator, first) catch return error.OutOfMemory;
+        try results.append(allocator, first);
 
         while (pos.* < input.len and input[pos.*] == ',') {
             pos.* += 1; // skip comma
             const r: Result = try .parse(allocator, input, pos);
-            results.append(allocator, r) catch return error.OutOfMemory;
+            try results.append(allocator, r);
         }
 
         if (pos.* >= input.len or input[pos.*] != '}') return error.UnexpectedChar;
         pos.* += 1; // skip '}'
 
         return .{
-            .results = results.toOwnedSlice(allocator) catch return error.OutOfMemory,
+            .results = try results.toOwnedSlice(allocator),
         };
     }
 
@@ -104,11 +104,11 @@ pub const Tuple = struct {
         while (pos.* < input.len and input[pos.*] == ',') {
             pos.* += 1; // skip comma
             const r: Result = try .parse(allocator, input, pos);
-            results.append(allocator, r) catch return error.OutOfMemory;
+            try results.append(allocator, r);
         }
 
         return .{
-            .results = results.toOwnedSlice(allocator) catch return error.OutOfMemory,
+            .results = try results.toOwnedSlice(allocator),
         };
     }
 
@@ -208,32 +208,32 @@ pub const List = union(enum) {
             // List of values
             var values: std.ArrayListUnmanaged(Value) = .empty;
             const first: Value = try .parse(allocator, input, pos);
-            values.append(allocator, first) catch return error.OutOfMemory;
+            try values.append(allocator, first);
 
             while (pos.* < input.len and input[pos.*] == ',') {
                 pos.* += 1;
                 const v: Value = try .parse(allocator, input, pos);
-                values.append(allocator, v) catch return error.OutOfMemory;
+                try values.append(allocator, v);
             }
 
             if (pos.* >= input.len or input[pos.*] != ']') return error.UnexpectedChar;
             pos.* += 1;
-            return .{ .values = values.toOwnedSlice(allocator) catch return error.OutOfMemory };
+            return .{ .values = try values.toOwnedSlice(allocator) };
         } else {
             // List of results (key=value pairs)
             var results: std.ArrayListUnmanaged(Result) = .empty;
             const first: Result = try .parse(allocator, input, pos);
-            results.append(allocator, first) catch return error.OutOfMemory;
+            try results.append(allocator, first);
 
             while (pos.* < input.len and input[pos.*] == ',') {
                 pos.* += 1;
                 const r: Result = try .parse(allocator, input, pos);
-                results.append(allocator, r) catch return error.OutOfMemory;
+                try results.append(allocator, r);
             }
 
             if (pos.* >= input.len or input[pos.*] != ']') return error.UnexpectedChar;
             pos.* += 1;
-            return .{ .results = results.toOwnedSlice(allocator) catch return error.OutOfMemory };
+            return .{ .results = try results.toOwnedSlice(allocator) };
         }
     }
 
@@ -589,7 +589,7 @@ fn parseCString(allocator: Allocator, input: []const u8, pos: *usize) ParseError
         const c = input[pos.*];
         if (c == '"') {
             pos.* += 1; // skip closing quote
-            return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
+            return try buf.toOwnedSlice(allocator);
         }
         if (c == '\\') {
             pos.* += 1;
@@ -623,9 +623,9 @@ fn parseCString(allocator: Allocator, input: []const u8, pos: *usize) ParseError
                 // now advance past the escaped char
                 pos.* += 1;
             }
-            buf.append(allocator, replacement) catch return error.OutOfMemory;
+            try buf.append(allocator, replacement);
         } else {
-            buf.append(allocator, c) catch return error.OutOfMemory;
+            try buf.append(allocator, c);
             pos.* += 1;
         }
     }
