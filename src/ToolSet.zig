@@ -149,6 +149,12 @@ pub fn register(self: *ToolSet, server: *mcp.Server) !void {
     }
 }
 
+fn errResult(allocator: std.mem.Allocator, msg: []const u8, err: anyerror) ToolError!ToolResult {
+    const text = std.fmt.allocPrint(allocator, "{s}: {s}", .{ msg, @errorName(err) }) catch
+        return try mcp.tools.errorResult(allocator, msg);
+    return try mcp.tools.errorResult(allocator, text);
+}
+
 fn formatStopReason(allocator: std.mem.Allocator, stop_record: ?mi.AsyncRecord) ![]const u8 {
     const r = stop_record orelse return try std.fmt.allocPrint(allocator, "stopped", .{});
     const reason = r.results.getString("reason") orelse "unknown";
@@ -180,15 +186,15 @@ fn readRegisters(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var names_resp = ts.client.command(allocator, "data-list-register-names") catch
-        return try mcp.tools.errorResult(allocator, "Failed to list register names");
+    var names_resp = ts.client.command(allocator, "data-list-register-names") catch |err|
+        return errResult(allocator, "Failed to list register names", err);
     defer names_resp.deinit();
 
     if (names_resp.isError())
         return try mcp.tools.errorResult(allocator, names_resp.errorMessage() orelse "Unknown error");
 
-    var values_resp = ts.client.command(allocator, "data-list-register-values x") catch
-        return try mcp.tools.errorResult(allocator, "Failed to read register values");
+    var values_resp = ts.client.command(allocator, "data-list-register-values x") catch |err|
+        return errResult(allocator, "Failed to read register values", err);
     defer values_resp.deinit();
 
     if (values_resp.isError())
@@ -234,8 +240,8 @@ fn step(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch
-        return try mcp.tools.errorResult(allocator, "Failed to step");
+    var resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
+        return errResult(allocator, "Failed to step", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -252,8 +258,8 @@ fn cont(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var resp = ts.client.commandExpectStop(allocator, "exec-continue") catch
-        return try mcp.tools.errorResult(allocator, "Failed to continue");
+    var resp = ts.client.commandExpectStop(allocator, "exec-continue") catch |err|
+        return errResult(allocator, "Failed to continue", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -270,8 +276,8 @@ fn stop(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var resp = ts.client.command(allocator, "exec-interrupt") catch
-        return try mcp.tools.errorResult(allocator, "Failed to interrupt");
+    var resp = ts.client.command(allocator, "exec-interrupt") catch |err|
+        return errResult(allocator, "Failed to interrupt", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -296,8 +302,8 @@ fn readMemory(
     const cmd = try std.fmt.allocPrint(allocator, "data-read-memory-bytes {s} {d}", .{ address, count });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to read memory");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to read memory", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -348,8 +354,8 @@ fn writeMemory(
     const cmd = try std.fmt.allocPrint(allocator, "data-write-memory-bytes {s} {s}", .{ address, data });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to write memory");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to write memory", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -389,8 +395,8 @@ fn setBreakpoint(
     const cmd = try cmd_buf.toOwnedSlice(allocator);
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to set breakpoint");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to set breakpoint", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -430,8 +436,8 @@ fn removeBreakpoint(
     const cmd = try std.fmt.allocPrint(allocator, "break-delete {d}", .{number});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to remove breakpoint");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to remove breakpoint", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -449,8 +455,8 @@ fn listBreakpoints(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var resp = ts.client.command(allocator, "break-list") catch
-        return try mcp.tools.errorResult(allocator, "Failed to list breakpoints");
+    var resp = ts.client.command(allocator, "break-list") catch |err|
+        return errResult(allocator, "Failed to list breakpoints", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -506,8 +512,8 @@ fn backtrace(
 ) ToolError!ToolResult {
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
-    var resp = ts.client.command(allocator, "stack-list-frames") catch
-        return try mcp.tools.errorResult(allocator, "Failed to get backtrace");
+    var resp = ts.client.command(allocator, "stack-list-frames") catch |err|
+        return errResult(allocator, "Failed to get backtrace", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -568,8 +574,8 @@ fn disassemble(
     const cmd = try std.fmt.allocPrint(allocator, "data-disassemble -s {s} -e {s}+{d} -- 0", .{ address, address, count * 4 });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to disassemble");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to disassemble", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -631,8 +637,8 @@ fn writeRegister(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression ${s}={s}", .{ reg_name, value });
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to write register");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to write register", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -656,8 +662,8 @@ fn evalExpression(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression {s}", .{expression});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to evaluate expression");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to evaluate expression", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -681,8 +687,8 @@ fn lookupSymbol(
     const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression &{s}", .{name});
     defer allocator.free(cmd);
 
-    var resp = ts.client.command(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to lookup symbol");
+    var resp = ts.client.command(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to lookup symbol", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -754,8 +760,8 @@ fn monitor(
     const cmd = try std.fmt.allocPrint(allocator, "monitor {s}", .{command});
     defer allocator.free(cmd);
 
-    var resp = ts.client.cliCommand(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to execute monitor command");
+    var resp = ts.client.cliCommand(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to execute monitor command", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -777,18 +783,18 @@ fn stepiNoIrq(
     const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
 
     // Save current sstep mask
-    var save_resp = ts.client.cliCommand(allocator, "maintenance packet qqemu.sstep") catch
-        return try mcp.tools.errorResult(allocator, "Failed to query sstep mask");
+    var save_resp = ts.client.cliCommand(allocator, "maintenance packet qqemu.sstep") catch |err|
+        return errResult(allocator, "Failed to query sstep mask", err);
     defer save_resp.deinit();
 
     // Set sstep mask to suppress IRQs and timers (ENABLE=0x1 | NOTIMER=0x4 = 0x5)
-    var set_resp = ts.client.cliCommand(allocator, "maintenance packet Qqemu.sstep=0x5") catch
-        return try mcp.tools.errorResult(allocator, "Failed to set sstep mask");
+    var set_resp = ts.client.cliCommand(allocator, "maintenance packet Qqemu.sstep=0x5") catch |err|
+        return errResult(allocator, "Failed to set sstep mask", err);
     defer set_resp.deinit();
 
     // Step one instruction
-    var step_resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch
-        return try mcp.tools.errorResult(allocator, "Failed to step");
+    var step_resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch |err|
+        return errResult(allocator, "Failed to step", err);
     defer step_resp.deinit();
 
     // Restore original sstep mask by extracting it from the save response
@@ -828,8 +834,8 @@ fn setPhysicalMemoryMode(
     else
         "maintenance packet Qqemu.PhyMemMode:0";
 
-    var resp = ts.client.cliCommand(allocator, cmd) catch
-        return try mcp.tools.errorResult(allocator, "Failed to set physical memory mode");
+    var resp = ts.client.cliCommand(allocator, cmd) catch |err|
+        return errResult(allocator, "Failed to set physical memory mode", err);
     defer resp.deinit();
 
     if (resp.isError())
@@ -856,14 +862,14 @@ fn readPageTable(
     var mode: u4 = undefined;
 
     if (mcp.tools.getString(arguments, "address")) |addr_str| {
-        root_ppn = std.fmt.parseInt(u64, stripHexPrefix(addr_str), 16) catch
-            return try mcp.tools.errorResult(allocator, "Invalid address");
+        root_ppn = std.fmt.parseInt(u64, stripHexPrefix(addr_str), 16) catch |err|
+            return errResult(allocator, "Invalid address", err);
         root_ppn >>= 12; // convert physical address to PPN
         mode = 8; // assume Sv39
     } else {
         // Read satp CSR
-        var resp = ts.client.command(allocator, "data-evaluate-expression $satp") catch
-            return try mcp.tools.errorResult(allocator, "Failed to read satp");
+        var resp = ts.client.command(allocator, "data-evaluate-expression $satp") catch |err|
+            return errResult(allocator, "Failed to read satp", err);
         defer resp.deinit();
 
         if (resp.isError())
@@ -872,8 +878,8 @@ fn readPageTable(
         const satp_str = resp.result.results.getString("value") orelse
             return try mcp.tools.errorResult(allocator, "Could not read satp value");
 
-        const satp = std.fmt.parseInt(u64, stripHexPrefix(satp_str), 16) catch
-            return try mcp.tools.errorResult(allocator, "Could not parse satp value");
+        const satp = std.fmt.parseInt(u64, stripHexPrefix(satp_str), 16) catch |err|
+            return errResult(allocator, "Could not parse satp value", err);
 
         mode = @truncate(satp >> 60);
         root_ppn = satp & ((1 << 44) - 1);
