@@ -10,7 +10,7 @@ child: std.process.Child,
 reader: Io.File.Reader,
 writer: Io.File.Writer,
 next_token: u32 = 1,
-read_buf: [64 * 1024]u8 = undefined,
+read_buf: [64 * 1024]u8 = .{0} ** (64 * 1024),
 
 pub const Error = error{
     GdbError,
@@ -105,24 +105,18 @@ pub fn init(io: Io, allocator: Allocator, config: Config) Error!@This() {
         return Error.ReadFailed;
     };
 
-    var client: Client = .{
+    return .{
         .child = child,
         .reader = undefined,
-        .writer = undefined,
+        .writer = Io.File.Writer.initStreaming(child.stdin.?, io, &.{}),
     };
-    client.reader = Io.File.Reader.initStreaming(child.stdout.?, io, &client.read_buf);
-    client.writer = Io.File.Writer.initStreaming(child.stdin.?, io, &.{});
-    client.consumeUntilPrompt(allocator) catch |err| {
-        std.debug.print("GDB failed during startup: {s}\n", .{@errorName(err)});
-        return err;
-    };
+}
 
-    if (config.target_remote) |target| {
-        var resp = try client.connect(allocator, target);
-        resp.deinit();
-    }
-
-    return client;
+/// Initialize the reader and consume GDB startup output. Must be
+/// called after the Client is at its final memory location.
+pub fn start(self: *Client, io: Io, allocator: Allocator) Error!void {
+    self.reader = Io.File.Reader.initStreaming(self.child.stdout.?, io, &self.read_buf);
+    try self.consumeUntilPrompt(allocator);
 }
 
 pub fn deinit(self: *Client, io: Io) void {
@@ -247,7 +241,11 @@ fn flush(self: *Client) Error!void {
 }
 
 fn readLine(self: *Client) Error![]const u8 {
-    return self.reader.interface.takeDelimiterExclusive('\n') catch return Error.ReadFailed;
+    const result = self.reader.interface.takeDelimiterInclusive('\n') catch return Error.ReadFailed;
+    // Strip the trailing newline
+    if (result.len > 0 and result[result.len - 1] == '\n')
+        return result[0 .. result.len - 1];
+    return result;
 }
 
 fn consumeUntilPrompt(self: *Client, allocator: Allocator) Error!void {

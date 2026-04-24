@@ -15,6 +15,19 @@ client: *Client,
 pub fn register(self: *ToolSet, server: *mcp.Server) !void {
     const tools = [_]mcp.tools.Tool{
         .{
+            .name = "target_connect",
+            .description = "Connect GDB to a remote target. Args: target (string, e.g. ':1234' or 'localhost:1234'), image (string, optional path to ELF binary to load symbols from)",
+            .handler = targetConnect,
+            .user_data = self,
+        },
+        .{
+            .name = "target_disconnect",
+            .description = "Disconnect GDB from the remote target. QEMU stays paused and can be reconnected.",
+            .handler = targetDisconnect,
+            .annotations = .{ .idempotentHint = true },
+            .user_data = self,
+        },
+        .{
             .name = "read_registers",
             .description = "Read all CPU register values",
             .handler = readRegisters,
@@ -176,6 +189,57 @@ fn formatStopReason(allocator: std.mem.Allocator, stop_record: ?mi.AsyncRecord) 
     }
     try output.append(allocator, '\n');
     return try output.toOwnedSlice(allocator);
+}
+
+fn targetConnect(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+
+    const target = mcp.tools.getString(arguments, "target") orelse
+        return try mcp.tools.errorResult(allocator, "Missing required argument: target (e.g. ':1234')");
+
+    // Optionally load symbol file first
+    if (mcp.tools.getString(arguments, "image")) |image| {
+        const file_cmd = try std.fmt.allocPrint(allocator, "file-exec-and-symbols {s}", .{image});
+        defer allocator.free(file_cmd);
+        var file_resp = ts.client.command(allocator, file_cmd) catch |err| return errResult(allocator, "Failed to load symbols", err);
+        defer file_resp.deinit();
+        // Ignore errors — symbol loading is best-effort
+    }
+
+    var resp = ts.client.connect(allocator, target) catch |err| return errResult(allocator, "Failed to connect", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Connection failed");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    try output.appendSlice(allocator, "Connected to ");
+    try output.appendSlice(allocator, target);
+    try output.append(allocator, '\n');
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
+fn targetDisconnect(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+
+    var resp = ts.client.disconnect(allocator) catch |err| return errResult(allocator, "Failed to disconnect", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Disconnect failed");
+
+    return try mcp.tools.textResult(allocator, "Disconnected (QEMU stays paused)");
 }
 
 fn readRegisters(

@@ -25,6 +25,7 @@ fn run(init: std.process.Init) !void {
         return err;
     };
     defer client.deinit(io);
+    try client.start(io, allocator);
 
     var tool_set: ToolSet = .{ .client = &client };
 
