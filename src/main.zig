@@ -17,3 +17,8 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
 
     try server.run(io, allocator, .stdio);
 }
+
+test {
+    _ = @import("gdb/Client.zig");
+    _ = @import("gdb/mi.zig");
+}
