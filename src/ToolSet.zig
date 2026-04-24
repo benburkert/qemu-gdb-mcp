@@ -183,6 +183,25 @@ pub fn register(self: *ToolSet, server: *mcp.Server) !void {
             .user_data = self,
         },
         .{
+            .name = "read_csr",
+            .description = "Read and decode a RISC-V CSR. Args: name (string, e.g. 'mstatus', 'satp', 'scause', 'sstatus', 'sie', 'sip', 'stvec', 'sepc', 'stval'). Returns the raw value and decoded bit fields.",
+            .handler = readCsr,
+            .annotations = .{ .readOnlyHint = true, .idempotentHint = true, .destructiveHint = false, .openWorldHint = false },
+            .user_data = self,
+        },
+        .{
+            .name = "watchpoint",
+            .description = "Set a hardware watchpoint. Args: address (hex string, required), type (string: 'write', 'read', or 'access', default 'write')",
+            .handler = watchpoint,
+            .user_data = self,
+        },
+        .{
+            .name = "next",
+            .description = "Step over: execute one source line or instruction, stepping over function calls",
+            .handler = next,
+            .user_data = self,
+        },
+        .{
             .name = "read_page_table",
             .description = "Walk RISC-V page table. Args: address (physical address of root page table, optional - defaults to satp), depth (max levels to walk, default 3)",
             .handler = readPageTable,
@@ -929,18 +948,42 @@ fn listThreads(
 
     for (threads) |entry| {
         const thread = entry.tuple;
-        try output.appendSlice(allocator, thread.getString("id") orelse "?");
-        try output.appendSlice(allocator, "  ");
+        const thread_id = thread.getString("id") orelse "?";
+        try output.appendSlice(allocator, "Thread ");
+        try output.appendSlice(allocator, thread_id);
+
+        // Read mhartid for this thread to show the actual hart number
+        {
+            const sel_cmd = try std.fmt.allocPrint(allocator, "thread-select {s}", .{thread_id});
+            defer allocator.free(sel_cmd);
+            if (client.command(allocator, sel_cmd)) |sel_val| {
+                var sel = sel_val;
+                defer sel.deinit();
+            } else |_| {}
+
+            if (client.command(allocator, "data-evaluate-expression $mhartid")) |hartid_val| {
+                var hartid_resp = hartid_val;
+                defer hartid_resp.deinit();
+                if (!hartid_resp.isError()) {
+                    if (hartid_resp.result.results.getString("value")) |hartid| {
+                        try output.appendSlice(allocator, " (hart ");
+                        try output.appendSlice(allocator, hartid);
+                        try output.append(allocator, ')');
+                    }
+                }
+            } else |_| {}
+        }
+
         if (thread.getString("target-id")) |tid| {
-            try output.appendSlice(allocator, tid);
             try output.appendSlice(allocator, "  ");
+            try output.appendSlice(allocator, tid);
         }
         if (thread.getString("name")) |name| {
-            try output.appendSlice(allocator, name);
             try output.appendSlice(allocator, "  ");
+            try output.appendSlice(allocator, name);
         }
         if (thread.getString("state")) |state| {
-            try output.appendSlice(allocator, "(");
+            try output.appendSlice(allocator, "  (");
             try output.appendSlice(allocator, state);
             try output.appendSlice(allocator, ")");
         }
@@ -956,6 +999,16 @@ fn listThreads(
             }
         }
         try output.append(allocator, '\n');
+    }
+
+    // Restore the original thread
+    if (resp.result.results.getString("current-thread-id")) |current| {
+        const restore_cmd = try std.fmt.allocPrint(allocator, "thread-select {s}", .{current});
+        defer allocator.free(restore_cmd);
+        if (client.command(allocator, restore_cmd)) |restore_val| {
+            var restore = restore_val;
+            restore.deinit();
+        } else |_| {}
     }
 
     return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
@@ -1074,6 +1127,285 @@ fn setPhysicalMemoryMode(
         "Physical memory mode enabled (MMU bypassed)"
     else
         "Physical memory mode disabled (virtual addresses)");
+}
+
+fn readCsr(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
+
+    const name = mcp.tools.getString(arguments, "name") orelse
+        return try mcp.tools.errorResult(allocator, "Missing required argument: name (e.g. 'mstatus', 'satp', 'scause')");
+
+    const cmd = try std.fmt.allocPrint(allocator, "data-evaluate-expression ${s}", .{name});
+    defer allocator.free(cmd);
+
+    var resp = client.command(allocator, cmd) catch |err| return errResult(allocator, "Failed to read CSR", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    const val_str = resp.result.results.getString("value") orelse
+        return try mcp.tools.errorResult(allocator, "Could not read CSR value");
+
+    // Parse as hex, unsigned decimal, or signed decimal (rv32 returns negative for high-bit CSRs)
+    const val = std.fmt.parseInt(u64, stripHexPrefix(val_str), 16) catch
+        std.fmt.parseInt(u64, val_str, 10) catch
+            @as(u64, @bitCast(@as(i64, std.fmt.parseInt(i64, val_str, 10) catch
+                return try mcp.tools.textResult(allocator, try std.fmt.allocPrint(allocator, "{s} = {s}", .{ name, val_str })))));
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    try output.appendSlice(allocator, name);
+    try output.appendSlice(allocator, " = ");
+    {
+        var buf: [20]u8 = undefined;
+        const hex = std.fmt.bufPrint(&buf, "0x{x}", .{val}) catch "?";
+        try output.appendSlice(allocator, hex);
+    }
+    try output.append(allocator, '\n');
+
+    // Decode known CSRs
+    if (std.mem.eql(u8, name, "mstatus") or std.mem.eql(u8, name, "sstatus")) {
+        try decodeMstatus(&output, allocator, val, std.mem.eql(u8, name, "sstatus"));
+    } else if (std.mem.eql(u8, name, "scause") or std.mem.eql(u8, name, "mcause")) {
+        try decodeScause(&output, allocator, val);
+    } else if (std.mem.eql(u8, name, "satp")) {
+        try decodeSatp(&output, allocator, val);
+    } else if (std.mem.eql(u8, name, "sie") or std.mem.eql(u8, name, "sip") or
+        std.mem.eql(u8, name, "mie") or std.mem.eql(u8, name, "mip"))
+    {
+        try decodeInterruptBits(&output, allocator, val);
+    } else if (std.mem.eql(u8, name, "stvec") or std.mem.eql(u8, name, "mtvec")) {
+        try decodeTvec(&output, allocator, val);
+    }
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
+fn decodeMstatus(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64, is_sstatus: bool) !void {
+    const fields = .{
+        .{ "SIE", 1 },
+        .{ "MIE", 3 },
+        .{ "SPIE", 5 },
+        .{ "UBE", 6 },
+        .{ "MPIE", 7 },
+        .{ "SPP", 8 },
+        .{ "MPP", 11 },  // 2-bit field
+        .{ "FS", 13 },   // 2-bit field
+        .{ "XS", 15 },   // 2-bit field
+        .{ "MPRV", 17 },
+        .{ "SUM", 18 },
+        .{ "MXR", 19 },
+        .{ "TVM", 20 },
+        .{ "TW", 21 },
+        .{ "TSR", 22 },
+    };
+
+    try output.appendSlice(allocator, "  ");
+    var first = true;
+    inline for (fields) |field| {
+        const is_m_only = comptime (std.mem.eql(u8, field[0], "MIE") or
+            std.mem.eql(u8, field[0], "MPIE") or
+            std.mem.eql(u8, field[0], "MPP") or
+            std.mem.eql(u8, field[0], "MPRV"));
+
+        if (!is_m_only or !is_sstatus) {
+            const bit: u6 = field[1];
+            const is_two_bit = comptime (std.mem.eql(u8, field[0], "MPP") or
+                std.mem.eql(u8, field[0], "FS") or
+                std.mem.eql(u8, field[0], "XS"));
+            const field_val = if (is_two_bit) (val >> bit) & 0x3 else (val >> bit) & 0x1;
+
+            if (field_val != 0) {
+                if (!first) try output.appendSlice(allocator, " ");
+                first = false;
+                try output.appendSlice(allocator, field[0]);
+                try output.append(allocator, '=');
+                var buf: [4]u8 = undefined;
+                const num = std.fmt.bufPrint(&buf, "{d}", .{field_val}) catch "?";
+                try output.appendSlice(allocator, num);
+            }
+        }
+    }
+    try output.append(allocator, '\n');
+}
+
+fn decodeScause(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
+    const interrupt = (val >> 63) & 1 == 1;
+    const code: u6 = @truncate(val & 0x3F);
+
+    try output.appendSlice(allocator, "  ");
+    try output.appendSlice(allocator, if (interrupt) "Interrupt: " else "Exception: ");
+
+    const name = if (interrupt) switch (code) {
+        1 => "Supervisor software interrupt",
+        3 => "Machine software interrupt",
+        5 => "Supervisor timer interrupt",
+        7 => "Machine timer interrupt",
+        9 => "Supervisor external interrupt",
+        11 => "Machine external interrupt",
+        else => "Unknown interrupt",
+    } else switch (code) {
+        0 => "Instruction address misaligned",
+        1 => "Instruction access fault",
+        2 => "Illegal instruction",
+        3 => "Breakpoint",
+        4 => "Load address misaligned",
+        5 => "Load access fault",
+        6 => "Store/AMO address misaligned",
+        7 => "Store/AMO access fault",
+        8 => "Environment call from U-mode",
+        9 => "Environment call from S-mode",
+        11 => "Environment call from M-mode",
+        12 => "Instruction page fault",
+        13 => "Load page fault",
+        15 => "Store/AMO page fault",
+        else => "Unknown exception",
+    };
+    try output.appendSlice(allocator, name);
+    try output.append(allocator, '\n');
+}
+
+fn decodeSatp(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
+    const mode: u4 = @truncate(val >> 60);
+    const asid: u16 = @truncate((val >> 44) & 0xFFFF);
+    const ppn = val & ((1 << 44) - 1);
+
+    const mode_name: []const u8 = switch (mode) {
+        0 => "Bare (no translation)",
+        1 => "Sv32",
+        8 => "Sv39",
+        9 => "Sv48",
+        10 => "Sv57",
+        else => "Unknown",
+    };
+
+    try output.appendSlice(allocator, "  Mode=");
+    try output.appendSlice(allocator, mode_name);
+    {
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, " ASID={d} PPN=0x{x} (root=0x{x})", .{ asid, ppn, ppn << 12 }) catch "?";
+        try output.appendSlice(allocator, s);
+    }
+    try output.append(allocator, '\n');
+}
+
+fn decodeInterruptBits(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
+    const bits = .{
+        .{ "SSI", 1 },
+        .{ "MSI", 3 },
+        .{ "STI", 5 },
+        .{ "MTI", 7 },
+        .{ "SEI", 9 },
+        .{ "MEI", 11 },
+    };
+
+    try output.appendSlice(allocator, "  ");
+    var first = true;
+    inline for (bits) |bit| {
+        if ((val >> bit[1]) & 1 == 1) {
+            if (!first) try output.appendSlice(allocator, " ");
+            first = false;
+            try output.appendSlice(allocator, bit[0]);
+        }
+    }
+    if (first) try output.appendSlice(allocator, "(none)");
+    try output.append(allocator, '\n');
+}
+
+fn decodeTvec(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
+    const mode: u2 = @truncate(val & 0x3);
+    const base = val & ~@as(u64, 0x3);
+
+    try output.appendSlice(allocator, "  Mode=");
+    try output.appendSlice(allocator, switch (mode) {
+        0 => "Direct",
+        1 => "Vectored",
+        else => "Reserved",
+    });
+    {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, " Base=0x{x}", .{base}) catch "?";
+        try output.appendSlice(allocator, s);
+    }
+    try output.append(allocator, '\n');
+}
+
+fn watchpoint(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
+
+    const address = mcp.tools.getString(arguments, "address") orelse
+        return try mcp.tools.errorResult(allocator, "Missing required argument: address");
+
+    const wp_type = mcp.tools.getString(arguments, "type") orelse "write";
+
+    const flag = if (std.mem.eql(u8, wp_type, "read"))
+        " -r"
+    else if (std.mem.eql(u8, wp_type, "access"))
+        " -a"
+    else
+        "";
+
+    // Format as memory dereference for GDB: *(int *)0xaddr
+    const expr = try std.fmt.allocPrint(allocator, "*(int *){s}", .{address});
+    defer allocator.free(expr);
+
+    const cmd = try std.fmt.allocPrint(allocator, "break-watch{s} \"{s}\"", .{ flag, expr });
+    defer allocator.free(cmd);
+
+    var resp = client.command(allocator, cmd) catch |err| return errResult(allocator, "Failed to set watchpoint", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    // Response may contain wpt={number="N",exp="addr"}
+    if (resp.result.get("wpt")) |wpt_val| {
+        const wpt = wpt_val.tuple;
+        try output.appendSlice(allocator, "Watchpoint ");
+        try output.appendSlice(allocator, wpt.getString("number") orelse "?");
+        try output.appendSlice(allocator, ": ");
+        try output.appendSlice(allocator, wp_type);
+        try output.appendSlice(allocator, " on ");
+        try output.appendSlice(allocator, wpt.getString("exp") orelse address);
+    } else {
+        try output.appendSlice(allocator, "Watchpoint set on ");
+        try output.appendSlice(allocator, address);
+    }
+    try output.append(allocator, '\n');
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
+fn next(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+    const client = ts.client orelse return try mcp.tools.errorResult(allocator, "Not connected. Use target_connect first.");
+
+    var resp = client.commandExpectStop(allocator, "exec-next-instruction") catch |err|
+        return errResult(allocator, "Failed to next", err);
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    return try mcp.tools.textResult(allocator, try formatStopReason(allocator, resp.stop));
 }
 
 fn readPageTable(
