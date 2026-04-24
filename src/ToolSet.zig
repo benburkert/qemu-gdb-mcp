@@ -12,6 +12,7 @@ const ToolSet = @This();
 
 client: ?*Client = null,
 config: Client.Config,
+timeout_ns: u64 = 10 * std.time.ns_per_s,
 io: std.Io,
 allocator: std.mem.Allocator,
 
@@ -20,6 +21,7 @@ fn ensureClient(self: *ToolSet) !*Client {
 
     const c = try self.allocator.create(Client);
     c.* = try Client.init(self.io, self.allocator, self.config);
+    c.timeout_ns = self.timeout_ns;
     try c.start(self.io, self.allocator);
     self.client = c;
     return c;

@@ -21,7 +21,8 @@ fn run(init: std.process.Init) !void {
     const config = parseArgs(&args);
 
     var tool_set: ToolSet = .{
-        .config = config,
+        .config = config.client,
+        .timeout_ns = config.timeout_s * std.time.ns_per_s,
         .io = io,
         .allocator = allocator,
     };
@@ -39,16 +40,25 @@ fn run(init: std.process.Init) !void {
     try server.run(io, allocator, .stdio);
 }
 
-fn parseArgs(args: *std.process.Args.Iterator) Client.Config {
-    var config: Client.Config = .{};
+const AppConfig = struct {
+    client: Client.Config = .{},
+    timeout_s: u64 = 10,
+};
+
+fn parseArgs(args: *std.process.Args.Iterator) AppConfig {
+    var config: AppConfig = .{};
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--gdb")) {
-            config.gdb = args.next() orelse config.gdb;
+            config.client.gdb = args.next() orelse config.client.gdb;
         } else if (std.mem.eql(u8, arg, "--target-remote")) {
-            config.target_remote = args.next() orelse config.target_remote;
+            config.client.target_remote = args.next() orelse config.client.target_remote;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            if (args.next()) |t| {
+                config.timeout_s = std.fmt.parseInt(u64, t, 10) catch 10;
+            }
         } else {
-            config.image = arg;
+            config.client.image = arg;
         }
     }
 

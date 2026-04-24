@@ -9,7 +9,9 @@ const Client = @This();
 child: std.process.Child,
 reader: Io.File.Reader,
 writer: Io.File.Writer,
+io: Io = undefined,
 next_token: u32 = 1,
+timeout_ns: u64 = 10 * std.time.ns_per_s,
 read_buf: [64 * 1024]u8 = .{0} ** (64 * 1024),
 
 pub const Error = error{
@@ -20,6 +22,7 @@ pub const Error = error{
     WriteFailed,
     OutOfMemory,
     StreamTooLong,
+    Timeout,
 };
 
 pub const Response = struct {
@@ -115,6 +118,7 @@ pub fn init(io: Io, allocator: Allocator, config: Config) Error!@This() {
 /// Initialize the reader and consume GDB startup output. Must be
 /// called after the Client is at its final memory location.
 pub fn start(self: *Client, io: Io, allocator: Allocator) Error!void {
+    self.io = io;
     self.reader = Io.File.Reader.initStreaming(self.child.stdout.?, io, &self.read_buf);
     try self.consumeUntilPrompt(allocator);
 }
@@ -167,7 +171,11 @@ fn readResponse(self: *Client, allocator: Allocator, token: u32, expect_stop: bo
     var result: ?mi.ResultRecord = null;
     errdefer if (result) |r| r.deinit(allocator);
 
+    const t0: Io.Timestamp = .now(self.io, .awake);
+    const deadline_ns = t0.nanoseconds + @as(i96, self.timeout_ns);
+
     while (true) {
+        try self.waitForReadable(deadline_ns);
         const line = try self.readLine();
         const record: mi.Record = mi.Record.parse(allocator, line) catch return Error.UnexpectedRecord;
 
@@ -238,6 +246,33 @@ fn sendRaw(self: *Client, data: []const u8) Error!void {
 
 fn flush(self: *Client) Error!void {
     self.writer.interface.flush() catch return Error.WriteFailed;
+}
+
+fn waitForReadable(self: *Client, deadline_ns: i96) Error!void {
+    // If there's already buffered data, no need to poll
+    if (self.reader.interface.end > self.reader.interface.seek) return;
+
+    const POLLIN: i16 = 0x0001;
+    const fd = self.child.stdout.?.handle;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = POLLIN,
+        .revents = 0,
+    }};
+
+    while (true) {
+        const now: Io.Timestamp = .now(self.io, .awake);
+        const remaining_ns = deadline_ns - now.nanoseconds;
+        if (remaining_ns <= 0) return Error.Timeout;
+
+        // Poll with up to 1 second or remaining time, whichever is less
+        const remaining_ms = @divTrunc(remaining_ns, std.time.ns_per_ms);
+        const poll_ms: i32 = @intCast(@min(1000, remaining_ms));
+
+        const ready = std.posix.poll(&fds, poll_ms) catch return Error.ReadFailed;
+        if (ready > 0) return; // Data available
+        // Otherwise loop and check deadline again
+    }
 }
 
 fn readLine(self: *Client) Error![]const u8 {
