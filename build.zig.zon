@@ -3,7 +3,8 @@
     .version = "0.0.1",
     .dependencies = .{
         .mcp = .{
-            .path = "git+https://github.com/benburkert/mcp.zig.git#fdcf351801901424feedf5da33428c370ac4ae4a",
+            .url = "git+https://github.com/benburkert/mcp.zig.git?ref=zig-0.16.0#13d3456114f7eea516df5939ed6a227b6f99f290",
+            .hash = "mcp-0.0.3-cIUFg6iCAwDVdNyza5PLf4hcSXmBIv3ixYx01i5vpU_4",
         },
     },
     .minimum_zig_version = "0.16.0",
