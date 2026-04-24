@@ -123,6 +123,19 @@ pub fn register(self: *ToolSet, server: *mcp.Server) !void {
             .user_data = self,
         },
         .{
+            .name = "stepi_no_irq",
+            .description = "Single-step one instruction with IRQ/timer suppression. Prevents timer interrupts from disrupting stepping during kernel debugging.",
+            .handler = stepiNoIrq,
+            .user_data = self,
+        },
+        .{
+            .name = "set_physical_memory_mode",
+            .description = "Toggle QEMU physical memory mode. When enabled, read_memory/write_memory bypass the MMU. Args: enabled (bool)",
+            .handler = setPhysicalMemoryMode,
+            .annotations = .{ .idempotentHint = true },
+            .user_data = self,
+        },
+        .{
             .name = "read_page_table",
             .description = "Walk RISC-V page table. Args: address (physical address of root page table, optional - defaults to satp), depth (max levels to walk, default 3)",
             .handler = readPageTable,
@@ -761,6 +774,79 @@ fn monitor(
         return try mcp.tools.textResult(allocator, "OK");
 
     return try mcp.tools.textResult(allocator, console_out);
+}
+
+fn stepiNoIrq(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+
+    // Save current sstep mask
+    var save_resp = ts.client.cliCommand(allocator, "maintenance packet qqemu.sstep") catch
+        return try mcp.tools.errorResult(allocator, "Failed to query sstep mask");
+    defer save_resp.deinit();
+
+    // Set sstep mask to suppress IRQs and timers (ENABLE=0x1 | NOTIMER=0x4 = 0x5)
+    var set_resp = ts.client.cliCommand(allocator, "maintenance packet Qqemu.sstep=0x5") catch
+        return try mcp.tools.errorResult(allocator, "Failed to set sstep mask");
+    defer set_resp.deinit();
+
+    // Step one instruction
+    var step_resp = ts.client.commandExpectStop(allocator, "exec-step-instruction") catch
+        return try mcp.tools.errorResult(allocator, "Failed to step");
+    defer step_resp.deinit();
+
+    // Restore original sstep mask
+    const saved = save_resp.consoleOutput();
+    if (std.mem.indexOf(u8, saved, "0x")) |start| {
+        const hex_start = start;
+        var hex_end = hex_start + 2;
+        while (hex_end < saved.len and std.ascii.isHex(saved[hex_end])) : (hex_end += 1) {}
+        const restore_cmd = std.fmt.allocPrint(allocator, "maintenance packet Qqemu.sstep={s}", .{saved[hex_start..hex_end]}) catch return error.OutOfMemory;
+        defer allocator.free(restore_cmd);
+        if (ts.client.cliCommand(allocator, restore_cmd)) |resp_val| {
+            var resp = resp_val;
+            resp.deinit();
+        } else |_| {}
+    }
+
+    if (step_resp.isError())
+        return try mcp.tools.errorResult(allocator, step_resp.errorMessage() orelse "Unknown error");
+
+    const text = formatStopReason(allocator, step_resp.stop) catch return error.OutOfMemory;
+    return try mcp.tools.textResult(allocator, text);
+}
+
+fn setPhysicalMemoryMode(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+
+    const enabled = mcp.tools.getBoolean(arguments, "enabled") orelse
+        return try mcp.tools.errorResult(allocator, "Missing required argument: enabled (bool)");
+
+    const cmd = if (enabled)
+        "maintenance packet Qqemu.PhyMemMode:1"
+    else
+        "maintenance packet Qqemu.PhyMemMode:0";
+
+    var resp = ts.client.cliCommand(allocator, cmd) catch
+        return try mcp.tools.errorResult(allocator, "Failed to set physical memory mode");
+    defer resp.deinit();
+
+    if (resp.isError())
+        return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Unknown error");
+
+    return try mcp.tools.textResult(allocator, if (enabled)
+        "Physical memory mode enabled (MMU bypassed)"
+    else
+        "Physical memory mode disabled (virtual addresses)");
 }
 
 fn readPageTable(
