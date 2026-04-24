@@ -10,6 +10,7 @@ child: std.process.Child,
 reader: Io.File.Reader,
 writer: Io.File.Writer,
 next_token: u32 = 1,
+read_buf: [64 * 1024]u8 = undefined,
 
 pub const Error = error{
     GdbError,
@@ -98,17 +99,23 @@ pub fn init(io: Io, allocator: Allocator, config: Config) Error!@This() {
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return Error.ReadFailed;
+        .stderr = .pipe,
+    }) catch |err| {
+        std.debug.print("Failed to spawn GDB ({s}): {s}\n", .{ config.gdb, @errorName(err) });
+        return Error.ReadFailed;
+    };
 
     var client: Client = .{
         .child = child,
         .reader = undefined,
         .writer = undefined,
     };
-    client.reader = Io.File.Reader.initStreaming(child.stdout.?, io, &.{});
+    client.reader = Io.File.Reader.initStreaming(child.stdout.?, io, &client.read_buf);
     client.writer = Io.File.Writer.initStreaming(child.stdin.?, io, &.{});
-    try client.consumeUntilPrompt(allocator);
+    client.consumeUntilPrompt(allocator) catch |err| {
+        std.debug.print("GDB failed during startup: {s}\n", .{@errorName(err)});
+        return err;
+    };
 
     if (config.target_remote) |target| {
         var resp = try client.connect(allocator, target);
