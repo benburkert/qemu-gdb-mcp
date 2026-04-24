@@ -110,6 +110,12 @@ pub fn register(self: *ToolSet, server: *mcp.Server) !void {
             @as(ToolAnnotations, .{ .readOnlyHint = false, .idempotentHint = false, .destructiveHint = true, .openWorldHint = false }),
             &monitor,
         },
+        .{
+            "read_page_table",
+            "Walk RISC-V page table. Args: address (physical address of root page table, optional - defaults to satp), depth (max levels to walk, default 3)",
+            @as(ToolAnnotations, .{ .readOnlyHint = true, .idempotentHint = true, .destructiveHint = false, .openWorldHint = false }),
+            &readPageTable,
+        },
     };
 
     inline for (tool_defs) |def| {
@@ -748,6 +754,246 @@ fn monitor(
         return try mcp.tools.textResult(allocator, "OK");
 
     return try mcp.tools.textResult(allocator, console_out);
+}
+
+fn readPageTable(
+    user_data: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult {
+    const ts: *ToolSet = @ptrCast(@alignCast(user_data.?));
+
+    const max_depth: usize = @intCast(mcp.tools.getInteger(arguments, "depth") orelse 3);
+
+    // Determine page table root and mode
+    var root_ppn: u64 = undefined;
+    var mode: u4 = undefined;
+
+    if (mcp.tools.getString(arguments, "address")) |addr_str| {
+        root_ppn = std.fmt.parseInt(u64, stripHexPrefix(addr_str), 16) catch
+            return try mcp.tools.errorResult(allocator, "Invalid address");
+        root_ppn >>= 12; // convert physical address to PPN
+        mode = 8; // assume Sv39
+    } else {
+        // Read satp CSR
+        var resp = ts.client.command(allocator, "data-evaluate-expression $satp") catch
+            return try mcp.tools.errorResult(allocator, "Failed to read satp");
+        defer resp.deinit();
+
+        if (resp.isError())
+            return try mcp.tools.errorResult(allocator, resp.errorMessage() orelse "Failed to read satp");
+
+        const satp_str = resp.result.results.getString("value") orelse
+            return try mcp.tools.errorResult(allocator, "Could not read satp value");
+
+        const satp = std.fmt.parseInt(u64, stripHexPrefix(satp_str), 16) catch
+            return try mcp.tools.errorResult(allocator, "Could not parse satp value");
+
+        mode = @truncate(satp >> 60);
+        root_ppn = satp & ((1 << 44) - 1);
+    }
+
+    const page_mode: PageMode = switch (mode) {
+        0 => return try mcp.tools.textResult(allocator, "MMU disabled (satp mode = Bare)"),
+        1 => .sv32,
+        8 => .sv39,
+        9 => .sv48,
+        10 => .sv57,
+        else => return try mcp.tools.errorResult(
+            allocator,
+            std.fmt.allocPrint(allocator, "Unknown satp mode: {d}", .{mode}) catch return error.OutOfMemory,
+        ),
+    };
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    try output.appendSlice(allocator, page_mode.name());
+    try output.appendSlice(allocator, " page table at 0x");
+
+    const root_addr = root_ppn << 12;
+    {
+        var buf: [16]u8 = undefined;
+        const hex = std.fmt.bufPrint(&buf, "{x}", .{root_addr}) catch "?";
+        try output.appendSlice(allocator, hex);
+    }
+    try output.appendSlice(allocator, "\n\n");
+
+    // Walk the page table
+    const walk_depth = @min(page_mode.levels(), max_depth);
+    try walkPageTable(ts.client, allocator, &output, root_ppn, page_mode, walk_depth, 0, 0);
+
+    if (output.items.len == 0)
+        return try mcp.tools.textResult(allocator, "Empty page table");
+
+    return try mcp.tools.textResult(allocator, try output.toOwnedSlice(allocator));
+}
+
+const PageMode = enum {
+    sv32,
+    sv39,
+    sv48,
+    sv57,
+
+    fn name(self: PageMode) []const u8 {
+        return switch (self) {
+            .sv32 => "Sv32",
+            .sv39 => "Sv39",
+            .sv48 => "Sv48",
+            .sv57 => "Sv57",
+        };
+    }
+
+    fn levels(self: PageMode) usize {
+        return switch (self) {
+            .sv32 => 2,
+            .sv39 => 3,
+            .sv48 => 4,
+            .sv57 => 5,
+        };
+    }
+
+    fn vpnBits(self: PageMode) u6 {
+        return switch (self) {
+            .sv32 => 10,
+            .sv39, .sv48, .sv57 => 9,
+        };
+    }
+
+    fn pteBytes(self: PageMode) usize {
+        return switch (self) {
+            .sv32 => 4,
+            .sv39, .sv48, .sv57 => 8,
+        };
+    }
+
+    fn entriesPerTable(self: PageMode) usize {
+        return switch (self) {
+            .sv32 => 1024,
+            .sv39, .sv48, .sv57 => 512,
+        };
+    }
+
+    fn tableSize(self: PageMode) usize {
+        return self.entriesPerTable() * self.pteBytes();
+    }
+
+    fn ppnMask(self: PageMode) u64 {
+        return switch (self) {
+            .sv32 => (1 << 22) - 1,
+            .sv39, .sv48, .sv57 => (1 << 44) - 1,
+        };
+    }
+
+    fn vpnShift(self: PageMode, current_level: usize) u6 {
+        return @intCast(12 + (self.levels() - 1 - current_level) * self.vpnBits());
+    }
+
+    fn signExtendVa(self: PageMode, va: u64) u64 {
+        if (self == .sv32) return @as(u32, @truncate(va));
+        const va_bits: u6 = @intCast(12 + self.levels() * @as(usize, self.vpnBits()));
+        if (va >> (va_bits - 1) & 1 == 1) {
+            return va | ~((@as(u64, 1) << va_bits) - 1);
+        }
+        return va;
+    }
+
+    fn readPte(self: PageMode, hex: []const u8, index: usize) ?u64 {
+        const hex_chars = self.pteBytes() * 2;
+        const offset = index * hex_chars;
+        if (offset + hex_chars > hex.len) return null;
+
+        const pte_hex = hex[offset..][0..hex_chars];
+        var pte: u64 = 0;
+        for (0..self.pteBytes()) |byte_idx| {
+            const hi = std.fmt.charToDigit(pte_hex[byte_idx * 2], 16) catch return null;
+            const lo = std.fmt.charToDigit(pte_hex[byte_idx * 2 + 1], 16) catch return null;
+            const byte: u64 = (@as(u64, hi) << 4) | lo;
+            pte |= byte << @intCast(byte_idx * 8);
+        }
+        return pte;
+    }
+};
+
+fn walkPageTable(
+    client: *Client,
+    allocator: std.mem.Allocator,
+    output: *std.ArrayListUnmanaged(u8),
+    ppn: u64,
+    mode: PageMode,
+    remaining_depth: usize,
+    current_level: usize,
+    va_prefix: u64,
+) !void {
+    if (remaining_depth == 0) return;
+
+    const page_addr = ppn << 12;
+    const table_size = mode.tableSize();
+
+    const cmd = std.fmt.allocPrint(allocator, "data-read-memory-bytes 0x{x} {d}", .{ page_addr, table_size }) catch return;
+    defer allocator.free(cmd);
+
+    // Enable physical memory mode
+    _ = client.cliCommand(allocator, "maintenance packet Qqemu.PhyMemMode:1") catch return;
+    defer {
+        _ = client.cliCommand(allocator, "maintenance packet Qqemu.PhyMemMode:0") catch {};
+    }
+
+    var resp = client.command(allocator, cmd) catch return;
+    defer resp.deinit();
+
+    if (resp.isError()) return;
+
+    const memory_val = resp.result.get("memory") orelse return;
+    const memory = switch (memory_val) {
+        .list => |l| switch (l) {
+            .values => |vs| vs,
+            else => return,
+        },
+        else => return,
+    };
+
+    if (memory.len == 0) return;
+    const hex_data = memory[0].tuple.getString("contents") orelse return;
+
+    for (0..mode.entriesPerTable()) |i| {
+        const pte = mode.readPte(hex_data, i) orelse continue;
+        if (pte & 1 == 0) continue; // V bit not set
+
+        const pte_ppn = (pte >> 10) & mode.ppnMask();
+        const flags = pte & 0xFF;
+        const is_leaf = (flags & 0b1110) != 0;
+        const va = va_prefix | (@as(u64, i) << mode.vpnShift(current_level));
+
+        for (0..current_level) |_| try output.appendSlice(allocator, "  ");
+
+        {
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "[{d:>4}] 0x{x:0>16} -> 0x{x:0>16} {s}{s}{s}{s}{s}{s}{s}{s}\n", .{
+                i,
+                mode.signExtendVa(va),
+                pte_ppn << 12,
+                if (flags & 0x80 != 0) "D" else "-",
+                if (flags & 0x40 != 0) "A" else "-",
+                if (flags & 0x20 != 0) "G" else "-",
+                if (flags & 0x10 != 0) "U" else "-",
+                if (flags & 0x08 != 0) "X" else "-",
+                if (flags & 0x04 != 0) "W" else "-",
+                if (flags & 0x02 != 0) "R" else "-",
+                if (is_leaf) " (leaf)" else " (table)",
+            }) catch continue;
+            try output.appendSlice(allocator, line);
+        }
+
+        if (!is_leaf and remaining_depth > 1) {
+            try walkPageTable(client, allocator, output, pte_ppn, mode, remaining_depth - 1, current_level + 1, va);
+        }
+    }
+}
+
+fn stripHexPrefix(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'))
+        return s[2..];
+    return s;
 }
 
 fn extractValuesList(val: ?mi.Value) ?[]const mi.Value {
