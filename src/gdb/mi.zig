@@ -274,6 +274,7 @@ pub const Result = struct {
     value: Value,
 
     pub fn deinit(self: @This(), allocator: Allocator) void {
+        allocator.free(self.variable);
         self.value.deinit(allocator);
     }
 
@@ -285,7 +286,7 @@ pub const Result = struct {
         pos.* += 1; // skip '='
 
         const value: Value = try .parse(allocator, input, pos);
-        return .{ .variable = variable, .value = value };
+        return .{ .variable = try allocator.dupe(u8, variable), .value = value };
     }
 
     test "parse simple" {
@@ -345,11 +346,12 @@ pub const AsyncRecord = struct {
     results: Tuple,
 
     pub fn deinit(self: @This(), allocator: Allocator) void {
+        allocator.free(self.class);
         self.results.deinit(allocator);
     }
 
     pub fn parse(allocator: Allocator, token: ?u32, input: []const u8, pos: *usize) ParseError!@This() {
-        const class = parseWord(input, pos);
+        const class = try allocator.dupe(u8, parseWord(input, pos));
         const results: Tuple = try .parseResultList(allocator, input, pos);
         return .{ .token = token, .class = class, .results = results };
     }
