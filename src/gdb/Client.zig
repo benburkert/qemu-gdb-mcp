@@ -175,7 +175,14 @@ fn readResponse(self: *Client, allocator: Allocator, token: u32, expect_stop: bo
     const deadline_ns = t0.nanoseconds + @as(i96, self.timeout_ns);
 
     while (true) {
-        try self.waitForReadable(deadline_ns);
+        self.waitForReadable(deadline_ns) catch |err| {
+            if (err == Error.Timeout) {
+                // Send exec-interrupt to stop the target so it's in a known state
+                self.sendRaw("-exec-interrupt\n") catch {};
+                self.flush() catch {};
+            }
+            return err;
+        };
         const line = try self.readLine();
         const record: mi.Record = mi.Record.parse(allocator, line) catch return Error.UnexpectedRecord;
 

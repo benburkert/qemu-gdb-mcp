@@ -13,6 +13,7 @@ const ToolSet = @This();
 client: ?*Client = null,
 config: Client.Config,
 timeout_ns: u64 = 10 * std.time.ns_per_s,
+xlen: ?u7 = null,
 io: std.Io,
 allocator: std.mem.Allocator,
 
@@ -25,6 +26,27 @@ fn ensureClient(self: *ToolSet) !*Client {
     try c.start(self.io, self.allocator);
     self.client = c;
     return c;
+}
+
+fn detectXlen(self: *ToolSet, allocator: std.mem.Allocator) u7 {
+    if (self.xlen) |x| return x;
+
+    const client = self.client orelse return 64;
+
+    // Try evaluating sizeof($pc) which returns the byte width of the PC register
+    var resp = client.command(allocator, "data-evaluate-expression sizeof($pc)") catch return 64;
+    defer resp.deinit();
+
+    if (!resp.isError()) {
+        if (resp.result.results.getString("value")) |val| {
+            const bytes = std.fmt.parseInt(u7, val, 10) catch return 64;
+            const xlen: u7 = bytes * 8;
+            self.xlen = xlen;
+            return xlen;
+        }
+    }
+
+    return 64;
 }
 
 pub fn deinit(self: *ToolSet) void {
@@ -323,10 +345,10 @@ fn readRegisters(
     if (values_resp.isError())
         return try mcp.tools.errorResult(allocator, values_resp.errorMessage() orelse "Unknown error");
 
-    const names = extractValuesList(names_resp.result.get("register-names")) orelse
+    const names = extractValuesList(allocator, names_resp.result.get("register-names")) orelse
         return try mcp.tools.errorResult(allocator, "Missing register-names in response");
 
-    const values = extractValuesList(values_resp.result.get("register-values")) orelse
+    const values = extractValuesList(allocator, values_resp.result.get("register-values")) orelse
         return try mcp.tools.errorResult(allocator, "Missing register-values in response");
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
@@ -1156,10 +1178,14 @@ fn readCsr(
         return try mcp.tools.errorResult(allocator, "Could not read CSR value");
 
     // Parse as hex, unsigned decimal, or signed decimal (rv32 returns negative for high-bit CSRs)
-    const val = std.fmt.parseInt(u64, stripHexPrefix(val_str), 16) catch
+    const raw_val = std.fmt.parseInt(u64, stripHexPrefix(val_str), 16) catch
         std.fmt.parseInt(u64, val_str, 10) catch
             @as(u64, @bitCast(@as(i64, std.fmt.parseInt(i64, val_str, 10) catch
                 return try mcp.tools.textResult(allocator, try std.fmt.allocPrint(allocator, "{s} = {s}", .{ name, val_str })))));
+
+    // Mask to XLEN bits to avoid sign-extension artifacts from rv32
+    const xlen = ts.detectXlen(allocator);
+    const val = if (xlen < 64) raw_val & ((@as(u64, 1) << @intCast(xlen)) - 1) else raw_val;
 
     var output: std.ArrayListUnmanaged(u8) = .empty;
     try output.appendSlice(allocator, name);
@@ -1175,9 +1201,9 @@ fn readCsr(
     if (std.mem.eql(u8, name, "mstatus") or std.mem.eql(u8, name, "sstatus")) {
         try decodeMstatus(&output, allocator, val, std.mem.eql(u8, name, "sstatus"));
     } else if (std.mem.eql(u8, name, "scause") or std.mem.eql(u8, name, "mcause")) {
-        try decodeScause(&output, allocator, val);
+        try decodeScause(&output, allocator, val, xlen);
     } else if (std.mem.eql(u8, name, "satp")) {
-        try decodeSatp(&output, allocator, val);
+        try decodeSatp(&output, allocator, val, xlen);
     } else if (std.mem.eql(u8, name, "sie") or std.mem.eql(u8, name, "sip") or
         std.mem.eql(u8, name, "mie") or std.mem.eql(u8, name, "mip"))
     {
@@ -1237,8 +1263,9 @@ fn decodeMstatus(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
     try output.append(allocator, '\n');
 }
 
-fn decodeScause(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
-    const interrupt = (val >> 63) & 1 == 1;
+fn decodeScause(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64, xlen: u7) !void {
+    const int_bit: u6 = if (xlen == 32) 31 else 63;
+    const interrupt = (val >> int_bit) & 1 == 1;
     const code: u6 = @truncate(val & 0x3F);
 
     try output.appendSlice(allocator, "  ");
@@ -1273,10 +1300,22 @@ fn decodeScause(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocato
     try output.append(allocator, '\n');
 }
 
-fn decodeSatp(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64) !void {
-    const mode: u4 = @truncate(val >> 60);
-    const asid: u16 = @truncate((val >> 44) & 0xFFFF);
-    const ppn = val & ((1 << 44) - 1);
+fn decodeSatp(output: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, val: u64, xlen: u7) !void {
+    var mode: u4 = undefined;
+    var asid: u16 = undefined;
+    var ppn: u64 = undefined;
+
+    if (xlen == 32) {
+        // rv32 satp: bit 31 = mode, bits 30:22 = ASID, bits 21:0 = PPN
+        mode = if (val >> 31 & 1 == 1) 1 else 0;
+        asid = @truncate((val >> 22) & 0x1FF);
+        ppn = val & 0x3FFFFF;
+    } else {
+        // rv64 satp: bits 63:60 = mode, bits 59:44 = ASID, bits 43:0 = PPN
+        mode = @truncate(val >> 60);
+        asid = @truncate((val >> 44) & 0xFFFF);
+        ppn = val & ((1 << 44) - 1);
+    }
 
     const mode_name: []const u8 = switch (mode) {
         0 => "Bare (no translation)",
@@ -1425,11 +1464,13 @@ fn readPageTable(
     var root_ppn: u64 = undefined;
     var mode: u4 = undefined;
 
+    const xlen = ts.detectXlen(allocator);
+
     if (mcp.tools.getString(arguments, "address")) |addr_str| {
         root_ppn = std.fmt.parseInt(u64, stripHexPrefix(addr_str), 16) catch |err|
             return errResult(allocator, "Invalid address", err);
         root_ppn >>= 12; // convert physical address to PPN
-        mode = 8; // assume Sv39
+        mode = if (xlen == 32) 1 else 8; // assume Sv32 for rv32, Sv39 for rv64
     } else {
         // Read satp CSR
         var resp = client.command(allocator, "data-evaluate-expression $satp") catch |err|
@@ -1442,11 +1483,24 @@ fn readPageTable(
         const satp_str = resp.result.results.getString("value") orelse
             return try mcp.tools.errorResult(allocator, "Could not read satp value");
 
-        const satp = std.fmt.parseInt(u64, stripHexPrefix(satp_str), 16) catch |err|
-            return errResult(allocator, "Could not parse satp value", err);
+        // Parse satp, handling signed decimal from rv32
+        const raw_satp = std.fmt.parseInt(u64, stripHexPrefix(satp_str), 16) catch
+            std.fmt.parseInt(u64, satp_str, 10) catch
+                @as(u64, @bitCast(@as(i64, std.fmt.parseInt(i64, satp_str, 10) catch |err|
+                    return errResult(allocator, "Could not parse satp value", err))));
 
-        mode = @truncate(satp >> 60);
-        root_ppn = satp & ((1 << 44) - 1);
+        // Mask to XLEN bits
+        const satp = if (xlen < 64) raw_satp & ((@as(u64, 1) << @intCast(xlen)) - 1) else raw_satp;
+
+        if (xlen == 32) {
+            // rv32 satp: bit 31 = mode (0=Bare, 1=Sv32), bits 30:22 = ASID, bits 21:0 = PPN
+            mode = if (satp >> 31 & 1 == 1) 1 else 0;
+            root_ppn = satp & 0x3FFFFF;
+        } else {
+            // rv64 satp: bits 63:60 = mode, bits 59:44 = ASID, bits 43:0 = PPN
+            mode = @truncate(satp >> 60);
+            root_ppn = satp & ((1 << 44) - 1);
+        }
     }
 
     const page_mode: PageMode = switch (mode) {
@@ -1651,12 +1705,18 @@ fn stripHexPrefix(s: []const u8) []const u8 {
     return s;
 }
 
-fn extractValuesList(val: ?mi.Value) ?[]const mi.Value {
+fn extractValuesList(allocator: std.mem.Allocator, val: ?mi.Value) ?[]const mi.Value {
     const v = val orelse return null;
     return switch (v) {
         .list => |l| switch (l) {
             .values => |vs| vs,
-            else => null,
+            .results => |rs| {
+                // Convert result list to value list (e.g. register-names may come as results)
+                var vals: std.ArrayListUnmanaged(mi.Value) = .empty;
+                for (rs) |r| vals.append(allocator, r.value) catch return null;
+                return vals.toOwnedSlice(allocator) catch null;
+            },
+            .empty => null,
         },
         else => null,
     };
